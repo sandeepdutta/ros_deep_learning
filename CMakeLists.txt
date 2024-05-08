@@ -3,10 +3,11 @@ cmake_minimum_required(VERSION 3.5)
 project(ros_deep_learning)
 
 # locate dependencies
-find_package(jetson-utils REQUIRED)
-find_package(jetson-inference REQUIRED)
-
+find_package(jetson-utils REQUIRED PATHS /workspaces/jetson-inference)
+find_package(jetson-inference REQUIRED PATHS /workspaces/jetson-inference)
 find_package(CUDA REQUIRED)
+find_package(OpenCV REQUIRED)
+find_package(image_transport)
 
 # detect ROS1 vs ROS2
 find_package(catkin QUIET)
@@ -17,7 +18,7 @@ set(ROS_DISTRO "ROS_${ROS_DISTRO}")
 message("detected ROS_DISTRO=${ROS_DISTRO}")
 
 find_package(VPI 2.0)
-link_directories(/usr/lib/aarch64-linux-gnu/tegra)
+link_directories(/usr/lib/aarch64-linux-gnu/tegra /opt/ros/humble/lib)
 
 if( catkin_FOUND )
 	message("detected ROS1 (catkin_make)")
@@ -46,16 +47,24 @@ else()
 
 	if( ament_cmake_FOUND )
 		message("detected ROS2 (ament_cmake)")
-
 		configure_file(${CMAKE_CURRENT_SOURCE_DIR}/package.ros2.xml ${CMAKE_CURRENT_SOURCE_DIR}/package.xml COPYONLY)
 
 		find_package(rclcpp REQUIRED)
 		find_package(std_msgs REQUIRED)
 		find_package(sensor_msgs REQUIRED)
 		find_package(vision_msgs REQUIRED)
+		find_package(cv_bridge REQUIRED)
+		find_package(OpenCV REQUIRED)
+		find_package(image_transport REQUIRED)
+		find_package(message_filters REQUIRED)
 
 		set(CMAKE_CXX_STANDARD 14)
-		include_directories(${CUDA_INCLUDE_DIRS})
+		include_directories(${CUDA_INCLUDE_DIRS} ${sensor_msgs_INCLUDE_DIRS}
+							/workspaces/jetson-inference/include
+							/opt/ros/humble/include/cv_bridge
+							/opt/ros/humble/include/image_transport
+							/opt/ros/humble/include/message_filters
+							)
 		add_definitions(-DROS2 -DROS_DISTRO=${ROS_DISTRO})
 
 	else()
@@ -71,10 +80,10 @@ add_executable(imagenet src/node_imagenet.cpp ${common_src})
 target_link_libraries(imagenet ${catkin_LIBRARIES} jetson-inference)
 
 add_executable(detectnet src/node_detectnet.cpp ${common_src})
-target_link_libraries(detectnet ${catkin_LIBRARIES} jetson-inference)
+target_link_libraries(detectnet ${catkin_LIBRARIES} jetson-inference cv_bridge message_filters)
 
 add_executable(segnet src/node_segnet.cpp ${common_src})
-target_link_libraries(segnet ${catkin_LIBRARIES} jetson-inference)
+target_link_libraries(segnet ${catkin_LIBRARIES} jetson-inference )
 
 add_executable(video_source src/node_video_source.cpp ${common_src})
 target_link_libraries(video_source ${catkin_LIBRARIES} jetson-inference)

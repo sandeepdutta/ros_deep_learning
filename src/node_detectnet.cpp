@@ -22,11 +22,21 @@
 
 #include "ros_compat.h"
 #include "image_converter.h"
-
+#include <cv_bridge/cv_bridge.h>
+#include <message_filters/subscriber.h>
+#include <message_filters/time_synchronizer.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/exact_time.h>
+#include <image_transport/image_transport.hpp>
+#include <sensor_msgs/image_encodings.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/highgui/highgui.hpp>
 #include <jetson-inference/detectNet.h>
 
 #include <unordered_map>
 
+// Define ExactTime sync policy
+typedef message_filters::sync_policies::ExactTime<sensor_msgs::msg::Image,sensor_msgs::msg::Image> ExactSyncPolicy;
 
 // globals
 detectNet* net = NULL;
@@ -49,6 +59,36 @@ void info_callback()
 	info_pub->publish(info_msg);
 }
 
+// publish overlay create overlay image using opencv
+bool publish_overlay(const sensor_msgs::msg::Image::ConstSharedPtr &input,
+					 const cv_bridge::CvImagePtr &cv_ptr, 
+					 detectNet::Detection* detections, int numDetections)
+{
+	// draw bounding boxes, labels, and confidence on the image
+	for (int i = 0; i < numDetections; i++)
+	{
+		detectNet::Detection* det = detections + i;
+		cv::Rect bbox(det->Left, det->Top, det->Width(), det->Height());
+		cv::rectangle(cv_ptr->image, bbox, cv::Scalar(0, 255, 0), 2);
+
+		std::string label = net->GetClassDesc(det->ClassID);
+		std::stringstream ss;
+		ss << label << " (" << det->Confidence << "," << det->MeanDistance << ")";
+		cv::putText(cv_ptr->image, ss.str(), cv::Point(det->Left, det->Top - 5), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
+	}
+
+	// convert the image back to ROS format
+	// Convert back to ROS and publish
+	cv_bridge::CvImage out_msg;
+    out_msg.header = input->header; // Same timestamp and tf frame as input image
+    out_msg.encoding = sensor_msgs::image_encodings::BGR8; // Or whatever
+    out_msg.image = cv_ptr->image;
+
+	// publish the overlay image
+	overlay_pub->publish(*(out_msg.toImageMsg()));
+
+	return true;
+}
 
 // publish overlay image
 bool publish_overlay( detectNet::Detection* detections, int numDetections )
@@ -61,13 +101,14 @@ bool publish_overlay( detectNet::Detection* detections, int numDetections )
 	if( !overlay_cvt->Resize(width, height, imageConverter::ROSOutputFormat) )
 		return false;
 
+	ROS_INFO("overlay %ux%u image", width, height);
 	// generate the overlay
 	if( !net->Overlay(input_cvt->ImageGPU(), overlay_cvt->ImageGPU(), width, height, 
 				   imageConverter::InternalFormat, detections, numDetections, overlay_flags) )
 	{
 		return false;
 	}
-
+	ROS_INFO("overlay generated");
 	// populate the message
 	sensor_msgs::Image msg;
 
@@ -80,16 +121,18 @@ bool publish_overlay( detectNet::Detection* detections, int numDetections )
 	// publish the message	
 	overlay_pub->publish(msg);
 	ROS_DEBUG("publishing %ux%u overlay image", width, height);
+	return true;
 }
 
 
 // input image subscriber callback
-void img_callback( const sensor_msgs::ImageConstPtr input )
+void img_callback( const sensor_msgs::msg::Image::ConstSharedPtr &input_color, 
+				   const sensor_msgs::msg::Image::ConstSharedPtr &input_depth )
 {
 	// convert the image to reside on GPU
-	if( !input_cvt || !input_cvt->Convert(input) )
+	if( !input_cvt || !input_cvt->Convert(input_color) )
 	{
-		ROS_INFO("failed to convert %ux%u %s image", input->width, input->height, input->encoding.c_str());
+		ROS_INFO("failed to convert %ux%u %s image", input_color->width, input_color->height, input_color->encoding.c_str());
 		return;	
 	}
 
@@ -101,14 +144,28 @@ void img_callback( const sensor_msgs::ImageConstPtr input )
 	// verify success	
 	if( numDetections < 0 )
 	{
-		ROS_ERROR("failed to run object detection on %ux%u image", input->width, input->height);
+		ROS_ERROR("failed to run object detection on %ux%u image", input_color->width, input_color->height);
 		return;
+	}
+
+	// convert the input image to OpenCV format
+	cv_bridge::CvImagePtr cv_ptr_color;
+	cv_bridge::CvImageConstPtr cv_ptr_depth;
+	try
+	{
+		cv_ptr_color = cv_bridge::toCvCopy(input_color, sensor_msgs::image_encodings::BGR8);
+		cv_ptr_depth = cv_bridge::toCvShare(input_depth, sensor_msgs::image_encodings::TYPE_16UC1);
+	}
+	catch (cv_bridge::Exception& e)
+	{
+		ROS_ERROR("cv_bridge exception: %s", e.what());
+		return ;
 	}
 
 	// if objects were detected, send out message
 	if( numDetections > 0 )
 	{
-		ROS_INFO("detected %i objects in %ux%u image", numDetections, input->width, input->height);
+		ROS_INFO("detected %i objects in %ux%u image", numDetections, input_color->width, input_color->height);
 		
 		// create a detection for each bounding box
 		vision_msgs::Detection2DArray msg;
@@ -119,7 +176,13 @@ void img_callback( const sensor_msgs::ImageConstPtr input )
 
 			ROS_INFO("object %i class #%u (%s)  confidence=%f", n, det->ClassID, net->GetClassDesc(det->ClassID), det->Confidence);
 			ROS_INFO("object %i bounding box (%f, %f)  (%f, %f)  w=%f  h=%f", n, det->Left, det->Top, det->Right, det->Bottom, det->Width(), det->Height()); 
-			
+			cv::Rect roi(det->Left, det->Top, det->Width(), det->Height());
+			// extract roi from the depth image
+			cv::Mat depth_roi = cv_ptr_depth->image(roi);
+			// get the mean depth value
+			cv::Scalar mean_depth = cv::mean(depth_roi);
+			ROS_INFO("object %i mean depth value = %f", n, mean_depth[0]);
+			det->MeanDistance = mean_depth[0];
 			// create a detection sub-message
 			vision_msgs::Detection2D detMsg;
 
@@ -159,11 +222,13 @@ void img_callback( const sensor_msgs::ImageConstPtr input )
 
 		// publish the detection message
 		detection_pub->publish(msg);
+	} else {
+		ROS_DEBUG("no objects detected in %ux%u image", input_color->width, input_color->height);
 	}
 
 	// generate the overlay (if there are subscribers)
 	if( ROS_NUM_SUBSCRIBERS(overlay_pub) > 0 )
-		publish_overlay(detections, numDetections);
+		publish_overlay(input_color,cv_ptr_color,detections, numDetections);
 }
 
 
@@ -302,8 +367,14 @@ int main(int argc, char **argv)
 	/*
 	 * subscribe to image topic
 	 */
-	auto img_sub = ROS_CREATE_SUBSCRIBER(sensor_msgs::Image, "image_in", 5, img_callback);
+	auto image_color_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(node, "image_in_color");
+	auto image_depth_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(node, "image_in_depth");
 
+    // Create the synchronizer with the policy
+    auto sync_ = std::make_shared<message_filters::Synchronizer<ExactSyncPolicy>>(ExactSyncPolicy(10), *image_color_sub_, *image_depth_sub_);
+    sync_->registerCallback(std::bind(&img_callback, std::placeholders::_1, std::placeholders::_2));
+   
+	//auto img_sub = ROS_CREATE_SUBSCRIBER(sensor_msgs::Image, "image_in", 5, img_callback);
 	
 	/*
 	 * wait for messages
